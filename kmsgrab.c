@@ -63,27 +63,45 @@ static inline void convert_to_24(drmModeFB *fb, uint24_t *to, void *from)
 	}
 }
 
-static int save_png(drmModeFB *fb, int prime_fd, const char *png_fn)
+static int save_png(drmModeFB *fb, int prime_fd, uint32_t pitch,
+		    const char *png_fn)
 {
 	png_bytep *row_pointers;
 	png_structp png;
 	png_infop info;
 	FILE *pngfile;
-	void *buffer, *picture;
+	void *buffer, *picture, *linear;
 	unsigned int i;
 	int ret;
+	size_t bytes_per_pixel = fb->bpp >> 3;
+	size_t linear_size = (size_t)fb->width * fb->height * bytes_per_pixel;
+	size_t mmap_size = (size_t)pitch * fb->height;
+
+	fprintf(stderr, "[debug] save_png: fb_id=%"PRIu32" width=%"PRIu32" height=%"PRIu32" bpp=%"PRIu32" depth=%"PRIu32" handle=%"PRIu32"\n",
+		fb->fb_id, fb->width, fb->height, fb->bpp, fb->depth, fb->handle);
+	fprintf(stderr, "[debug] save_png: prime_fd=%d pitch=%"PRIu32" png_fn=%s\n",
+		prime_fd, pitch, png_fn);
 
 	picture = malloc(fb->width * fb->height * 4);
 	if (!picture)
 		return -ENOMEM;
 
-	buffer = mmap(NULL, (fb->bpp >> 3) * fb->width * fb->height,
+	linear = malloc(linear_size);
+	if (!linear) {
+		ret = -ENOMEM;
+		goto out_free_picture;
+	}
+
+	buffer = mmap(NULL, mmap_size,
 		      PROT_READ, MAP_PRIVATE, prime_fd, 0);
 	if (buffer == MAP_FAILED) {
 		ret = -errno;
 		fprintf(stderr, "Unable to mmap prime buffer\n");
-		goto out_free_picture;
+		goto out_free_linear;
 	}
+
+	fprintf(stderr, "[debug] save_png: mmap length=%zu buffer=%p\n",
+		mmap_size, buffer);
 
 	/* Drop privileges, to write PNG with user rights */
 	seteuid(getuid());
@@ -115,8 +133,13 @@ static int save_png(drmModeFB *fb, int prime_fd, const char *png_fn)
 				PNG_FILTER_TYPE_BASE);
 	png_write_info(png, info);
 
-	// Convert the picture to a format that can be written into the PNG file (rgb888)
-	convert_to_24(fb, picture, buffer);
+	// Copy framebuffer using pitch to a linear buffer, then convert to rgb888.
+	for (i = 0; i < fb->height; i++)
+		memcpy((uint8_t *)linear + i * fb->width * bytes_per_pixel,
+		       (uint8_t *)buffer + i * pitch,
+		       fb->width * bytes_per_pixel);
+
+	convert_to_24(fb, picture, linear);
 
 	row_pointers = malloc(sizeof(*row_pointers) * fb->height);
 	if (!row_pointers) {
@@ -127,6 +150,9 @@ static int save_png(drmModeFB *fb, int prime_fd, const char *png_fn)
 	// And save the final image
 	for (i = 0; i < fb->height; i++)
 		row_pointers[i] = picture + i * fb->width * 3;
+
+	fprintf(stderr, "[debug] save_png: writing PNG rows=%"PRIu32" row_bytes=%"PRIu32"\n",
+		fb->height, fb->width * 3);
 
 	png_write_image(png, row_pointers);
 	png_write_end(png, info);
@@ -141,7 +167,9 @@ out_free_png:
 out_fclose:
 	fclose(pngfile);
 out_unmap_buffer:
-	munmap(buffer, (fb->bpp >> 3) * fb->width * fb->height);
+	munmap(buffer, mmap_size);
+out_free_linear:
+	free(linear);
 out_free_picture:
 	free(picture);
 	return ret;
@@ -152,9 +180,12 @@ int main(int argc, char **argv)
 	int err, drm_fd, prime_fd, retval = EXIT_FAILURE;
 	unsigned int i, card;
 	uint32_t fb_id, crtc_id;
+	uint32_t plane_id = 0;
 	drmModePlaneRes *plane_res;
 	drmModePlane *plane;
 	drmModeFB *fb;
+	drmModeFB2 *fb2;
+	uint32_t handle, pitch;
 	char buf[256];
 	uint64_t has_dumb;
 
@@ -203,8 +234,17 @@ int main(int argc, char **argv)
 
 	for (i = 0; i < plane_res->count_planes; i++) {
 		plane = drmModeGetPlane(drm_fd, plane_res->planes[i]);
+		if (!plane) {
+			fprintf(stderr, "[debug] plane[%u] id=%"PRIu32": drmModeGetPlane failed\n",
+				i, plane_res->planes[i]);
+			continue;
+		}
+		fprintf(stderr, "[debug] plane[%u] id=%"PRIu32" fb_id=%"PRIu32" crtc_id=%"PRIu32" crtc_x=%"PRIu32" crtc_y=%"PRIu32"\n",
+			i, plane->plane_id, plane->fb_id, plane->crtc_id,
+			plane->crtc_x, plane->crtc_y);
 		fb_id = plane->fb_id;
 		crtc_id = plane->crtc_id;
+		plane_id = plane->plane_id;
 		drmModeFreePlane(plane);
 
 		if (fb_id != 0 && crtc_id != 0)
@@ -223,14 +263,38 @@ int main(int argc, char **argv)
 		goto out_free_resources;
 	}
 
-	err = drmPrimeHandleToFD(drm_fd, fb->handle, O_RDONLY, &prime_fd);
+	fprintf(stderr, "[debug] using plane_id=%"PRIu32" fb_id=%"PRIu32" crtc_id=%"PRIu32"\n",
+		plane_id, fb_id, crtc_id);
+
+	fb2 = drmModeGetFB2(drm_fd, fb_id);
+	if (!fb2) {
+		fprintf(stderr, "[debug] drmModeGetFB2 failed for fb_id=%"PRIu32": %s\n",
+			fb_id, strerror(errno));
+		handle = fb->handle;
+		pitch = fb->width * (fb->bpp >> 3);
+	} else {
+		fprintf(stderr, "[debug] fb2: w=%"PRIu32" h=%"PRIu32" pixel_format=0x%"PRIx32" flags=0x%"PRIx32"\n",
+			fb2->width, fb2->height, fb2->pixel_format, fb2->flags);
+		fprintf(stderr, "[debug] fb2: handles={%"PRIu32",%"PRIu32",%"PRIu32",%"PRIu32"}\n",
+			fb2->handles[0], fb2->handles[1], fb2->handles[2], fb2->handles[3]);
+		fprintf(stderr, "[debug] fb2: pitches={%"PRIu32",%"PRIu32",%"PRIu32",%"PRIu32"}\n",
+			fb2->pitches[0], fb2->pitches[1], fb2->pitches[2], fb2->pitches[3]);
+		fprintf(stderr, "[debug] fb2: offsets={%"PRIu32",%"PRIu32",%"PRIu32",%"PRIu32"}\n",
+			fb2->offsets[0], fb2->offsets[1], fb2->offsets[2], fb2->offsets[3]);
+		fprintf(stderr, "[debug] fb2: modifier not printed (libdrm ABI varies)\n");
+		handle = fb2->handles[0];
+		pitch = fb2->pitches[0];
+		drmModeFreeFB2(fb2);
+	}
+
+	err = drmPrimeHandleToFD(drm_fd, handle, O_RDONLY, &prime_fd);
 	if (err < 0) {
 		fprintf(stderr, "Failed to retrieve prime handler: %s\n",
 			strerror(-err));
 		goto out_free_fb;
 	}
 
-	err = save_png(fb, prime_fd, argv[1]);
+	err = save_png(fb, prime_fd, pitch, argv[1]);
 	if (err < 0) {
 		fprintf(stderr, "Failed to take screenshot: %s\n",
 			strerror(-err));
