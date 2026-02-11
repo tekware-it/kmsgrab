@@ -26,6 +26,13 @@ typedef struct {
 	uint8_t r, g, b;
 } uint24_t;
 
+static int g_verbose;
+
+#define DBG(...) do { \
+	if (g_verbose) \
+		fprintf(stderr, __VA_ARGS__); \
+} while (0)
+
 static inline uint24_t rgb16_to_24(uint16_t px)
 {
 	uint24_t pixel;
@@ -79,9 +86,9 @@ static int save_png(drmModeFB *fb, int prime_fd, uint32_t pitch,
 	size_t linear_size = (size_t)fb->width * fb->height * bytes_per_pixel;
 	size_t mmap_size = (size_t)pitch * fb->height;
 
-	fprintf(stderr, "[debug] save_png: fb_id=%"PRIu32" width=%"PRIu32" height=%"PRIu32" bpp=%"PRIu32" depth=%"PRIu32" handle=%"PRIu32"\n",
+	DBG("[debug] save_png: fb_id=%"PRIu32" width=%"PRIu32" height=%"PRIu32" bpp=%"PRIu32" depth=%"PRIu32" handle=%"PRIu32"\n",
 		fb->fb_id, fb->width, fb->height, fb->bpp, fb->depth, fb->handle);
-	fprintf(stderr, "[debug] save_png: prime_fd=%d pitch=%"PRIu32" png_fn=%s\n",
+	DBG("[debug] save_png: prime_fd=%d pitch=%"PRIu32" png_fn=%s\n",
 		prime_fd, pitch, png_fn);
 
 	picture = malloc(fb->width * fb->height * 4);
@@ -102,7 +109,7 @@ static int save_png(drmModeFB *fb, int prime_fd, uint32_t pitch,
 		goto out_free_linear;
 	}
 
-	fprintf(stderr, "[debug] save_png: mmap length=%zu buffer=%p\n",
+	DBG("[debug] save_png: mmap length=%zu buffer=%p\n",
 		mmap_size, buffer);
 
 	/* Drop privileges, to write PNG with user rights */
@@ -153,7 +160,7 @@ static int save_png(drmModeFB *fb, int prime_fd, uint32_t pitch,
 	for (i = 0; i < fb->height; i++)
 		row_pointers[i] = picture + i * fb->width * 3;
 
-	fprintf(stderr, "[debug] save_png: writing PNG rows=%"PRIu32" row_bytes=%"PRIu32"\n",
+	DBG("[debug] save_png: writing PNG rows=%"PRIu32" row_bytes=%"PRIu32"\n",
 		fb->height, fb->width * 3);
 
 	png_write_image(png, row_pointers);
@@ -191,9 +198,9 @@ static int save_jpg(drmModeFB *fb, int prime_fd, uint32_t pitch,
 	size_t mmap_size = (size_t)pitch * fb->height;
 	JSAMPROW row_pointer[1];
 
-	fprintf(stderr, "[debug] save_jpg: fb_id=%"PRIu32" width=%"PRIu32" height=%"PRIu32" bpp=%"PRIu32" depth=%"PRIu32" handle=%"PRIu32"\n",
+	DBG("[debug] save_jpg: fb_id=%"PRIu32" width=%"PRIu32" height=%"PRIu32" bpp=%"PRIu32" depth=%"PRIu32" handle=%"PRIu32"\n",
 		fb->fb_id, fb->width, fb->height, fb->bpp, fb->depth, fb->handle);
-	fprintf(stderr, "[debug] save_jpg: prime_fd=%d pitch=%"PRIu32" jpg_fn=%s quality=%d\n",
+	DBG("[debug] save_jpg: prime_fd=%d pitch=%"PRIu32" jpg_fn=%s quality=%d\n",
 		prime_fd, pitch, jpg_fn, quality);
 
 	picture = malloc(fb->width * fb->height * 4);
@@ -213,7 +220,7 @@ static int save_jpg(drmModeFB *fb, int prime_fd, uint32_t pitch,
 		goto out_free_linear;
 	}
 
-	fprintf(stderr, "[debug] save_jpg: mmap length=%zu buffer=%p\n",
+	DBG("[debug] save_jpg: mmap length=%zu buffer=%p\n",
 		mmap_size, buffer);
 
 	/* Drop privileges, to write JPEG with user rights */
@@ -282,8 +289,18 @@ int main(int argc, char **argv)
 	uint64_t has_dumb;
 
 	if (argc < 2) {
-		printf("Usage: kmsgrab <output.png|output.jpg>\n");
+		printf("Usage: kmsgrab [-v] <output.png|output.jpg>\n");
 		goto out_return;
+	}
+
+	if (!strcmp(argv[1], "-v")) {
+		g_verbose = 1;
+		if (argc < 3) {
+			printf("Usage: kmsgrab [-v] <output.png|output.jpg>\n");
+			goto out_return;
+		}
+		argv++;
+		argc--;
 	}
 
 	for (card = 0; ; card++) {
@@ -327,11 +344,11 @@ int main(int argc, char **argv)
 	for (i = 0; i < plane_res->count_planes; i++) {
 		plane = drmModeGetPlane(drm_fd, plane_res->planes[i]);
 		if (!plane) {
-			fprintf(stderr, "[debug] plane[%u] id=%"PRIu32": drmModeGetPlane failed\n",
+			DBG("[debug] plane[%u] id=%"PRIu32": drmModeGetPlane failed\n",
 				i, plane_res->planes[i]);
 			continue;
 		}
-		fprintf(stderr, "[debug] plane[%u] id=%"PRIu32" fb_id=%"PRIu32" crtc_id=%"PRIu32" crtc_x=%"PRIu32" crtc_y=%"PRIu32"\n",
+		DBG("[debug] plane[%u] id=%"PRIu32" fb_id=%"PRIu32" crtc_id=%"PRIu32" crtc_x=%"PRIu32" crtc_y=%"PRIu32"\n",
 			i, plane->plane_id, plane->fb_id, plane->crtc_id,
 			plane->crtc_x, plane->crtc_y);
 		fb_id = plane->fb_id;
@@ -355,25 +372,25 @@ int main(int argc, char **argv)
 		goto out_free_resources;
 	}
 
-	fprintf(stderr, "[debug] using plane_id=%"PRIu32" fb_id=%"PRIu32" crtc_id=%"PRIu32"\n",
+	DBG("[debug] using plane_id=%"PRIu32" fb_id=%"PRIu32" crtc_id=%"PRIu32"\n",
 		plane_id, fb_id, crtc_id);
 
 	fb2 = drmModeGetFB2(drm_fd, fb_id);
 	if (!fb2) {
-		fprintf(stderr, "[debug] drmModeGetFB2 failed for fb_id=%"PRIu32": %s\n",
+		DBG("[debug] drmModeGetFB2 failed for fb_id=%"PRIu32": %s\n",
 			fb_id, strerror(errno));
 		handle = fb->handle;
 		pitch = fb->width * (fb->bpp >> 3);
 	} else {
-		fprintf(stderr, "[debug] fb2: w=%"PRIu32" h=%"PRIu32" pixel_format=0x%"PRIx32" flags=0x%"PRIx32"\n",
+		DBG("[debug] fb2: w=%"PRIu32" h=%"PRIu32" pixel_format=0x%"PRIx32" flags=0x%"PRIx32"\n",
 			fb2->width, fb2->height, fb2->pixel_format, fb2->flags);
-		fprintf(stderr, "[debug] fb2: handles={%"PRIu32",%"PRIu32",%"PRIu32",%"PRIu32"}\n",
+		DBG("[debug] fb2: handles={%"PRIu32",%"PRIu32",%"PRIu32",%"PRIu32"}\n",
 			fb2->handles[0], fb2->handles[1], fb2->handles[2], fb2->handles[3]);
-		fprintf(stderr, "[debug] fb2: pitches={%"PRIu32",%"PRIu32",%"PRIu32",%"PRIu32"}\n",
+		DBG("[debug] fb2: pitches={%"PRIu32",%"PRIu32",%"PRIu32",%"PRIu32"}\n",
 			fb2->pitches[0], fb2->pitches[1], fb2->pitches[2], fb2->pitches[3]);
-		fprintf(stderr, "[debug] fb2: offsets={%"PRIu32",%"PRIu32",%"PRIu32",%"PRIu32"}\n",
+		DBG("[debug] fb2: offsets={%"PRIu32",%"PRIu32",%"PRIu32",%"PRIu32"}\n",
 			fb2->offsets[0], fb2->offsets[1], fb2->offsets[2], fb2->offsets[3]);
-		fprintf(stderr, "[debug] fb2: modifier not printed (libdrm ABI varies)\n");
+		DBG("[debug] fb2: modifier not printed (libdrm ABI varies)\n");
 		handle = fb2->handles[0];
 		pitch = fb2->pitches[0];
 		drmModeFreeFB2(fb2);
