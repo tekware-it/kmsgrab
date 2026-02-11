@@ -27,11 +27,65 @@ typedef struct {
 } uint24_t;
 
 static int g_verbose;
+static int g_bilinear;
 
 #define DBG(...) do { \
 	if (g_verbose) \
 		fprintf(stderr, __VA_ARGS__); \
 } while (0)
+
+static uint8_t *scale_rgb24_bilinear(const uint8_t *src,
+				     uint32_t src_w, uint32_t src_h,
+				     uint32_t dst_w, uint32_t dst_h)
+{
+	uint8_t *dst;
+	uint32_t x, y;
+	uint32_t max_x = src_w ? src_w - 1 : 0;
+	uint32_t max_y = src_h ? src_h - 1 : 0;
+
+	dst = malloc((size_t)dst_w * dst_h * 3);
+	if (!dst)
+		return NULL;
+
+	if (dst_w == 0 || dst_h == 0 || src_w == 0 || src_h == 0)
+		return dst;
+
+	for (y = 0; y < dst_h; y++) {
+		uint32_t sy = (dst_h == 1) ? 0 :
+			(uint32_t)(((uint64_t)y * (src_h - 1) << 16) / (dst_h - 1));
+		uint32_t y0 = sy >> 16;
+		uint32_t y1 = y0 < max_y ? y0 + 1 : y0;
+		uint32_t fy = sy & 0xffff;
+
+		for (x = 0; x < dst_w; x++) {
+			uint32_t sx = (dst_w == 1) ? 0 :
+				(uint32_t)(((uint64_t)x * (src_w - 1) << 16) / (dst_w - 1));
+			uint32_t x0 = sx >> 16;
+			uint32_t x1 = x0 < max_x ? x0 + 1 : x0;
+			uint32_t fx = sx & 0xffff;
+
+			const uint8_t *p00 = src + (y0 * src_w + x0) * 3;
+			const uint8_t *p10 = src + (y0 * src_w + x1) * 3;
+			const uint8_t *p01 = src + (y1 * src_w + x0) * 3;
+			const uint8_t *p11 = src + (y1 * src_w + x1) * 3;
+			uint8_t *dp = dst + (y * dst_w + x) * 3;
+
+			uint64_t w00 = (uint64_t)(65536 - fx) * (65536 - fy);
+			uint64_t w10 = (uint64_t)fx * (65536 - fy);
+			uint64_t w01 = (uint64_t)(65536 - fx) * fy;
+			uint64_t w11 = (uint64_t)fx * fy;
+
+			dp[0] = (uint8_t)((p00[0] * w00 + p10[0] * w10 +
+					   p01[0] * w01 + p11[0] * w11 + (1ULL << 31)) >> 32);
+			dp[1] = (uint8_t)((p00[1] * w00 + p10[1] * w10 +
+					   p01[1] * w01 + p11[1] * w11 + (1ULL << 31)) >> 32);
+			dp[2] = (uint8_t)((p00[2] * w00 + p10[2] * w10 +
+					   p01[2] * w01 + p11[2] * w11 + (1ULL << 31)) >> 32);
+		}
+	}
+
+	return dst;
+}
 
 static uint8_t *scale_rgb24(const uint8_t *src,
 			    uint32_t src_w, uint32_t src_h,
@@ -57,6 +111,15 @@ static uint8_t *scale_rgb24(const uint8_t *src,
 	}
 
 	return dst;
+}
+
+static uint8_t *scale_rgb24_auto(const uint8_t *src,
+				 uint32_t src_w, uint32_t src_h,
+				 uint32_t dst_w, uint32_t dst_h)
+{
+	if (g_bilinear)
+		return scale_rgb24_bilinear(src, src_w, src_h, dst_w, dst_h);
+	return scale_rgb24(src, src_w, src_h, dst_w, dst_h);
 }
 
 static inline uint24_t rgb16_to_24(uint16_t px)
@@ -177,7 +240,7 @@ static int save_png(drmModeFB *fb, int prime_fd, uint32_t pitch,
 
 	convert_to_24(fb, (uint24_t *)picture, linear);
 	if (out_w != fb->width || out_h != fb->height) {
-		scaled = scale_rgb24(picture, fb->width, fb->height, out_w, out_h);
+		scaled = scale_rgb24_auto(picture, fb->width, fb->height, out_w, out_h);
 		if (!scaled) {
 			ret = -ENOMEM;
 			goto out_free_info;
@@ -280,7 +343,7 @@ static int save_jpg(drmModeFB *fb, int prime_fd, uint32_t pitch,
 
 	convert_to_24(fb, (uint24_t *)picture, linear);
 	if (out_w != fb->width || out_h != fb->height) {
-		scaled = scale_rgb24(picture, fb->width, fb->height, out_w, out_h);
+		scaled = scale_rgb24_auto(picture, fb->width, fb->height, out_w, out_h);
 		if (!scaled) {
 			ret = -ENOMEM;
 			goto out_unmap_buffer;
@@ -337,18 +400,29 @@ int main(int argc, char **argv)
 	drmModeFB2 *fb2;
 	uint32_t handle, pitch;
 	uint32_t out_w = 0, out_h = 0;
+	int jpeg_quality = 90;
 	char buf[256];
 	uint64_t has_dumb;
 
 	if (argc < 2) {
-		printf("Usage: kmsgrab [-v] [-width N] [-height N] <output.png|output.jpg>\n");
+		printf("Usage: kmsgrab [-v] [-bilinear] [-width N] [-height N] [--quality N] <output.png|output.jpg>\n");
 		goto out_return;
 	}
 
 	if (!strcmp(argv[1], "-v")) {
 		g_verbose = 1;
 		if (argc < 3) {
-			printf("Usage: kmsgrab [-v] [-width N] [-height N] <output.png|output.jpg>\n");
+			printf("Usage: kmsgrab [-v] [-bilinear] [-width N] [-height N] [--quality N] <output.png|output.jpg>\n");
+			goto out_return;
+		}
+		argv++;
+		argc--;
+	}
+
+	if (!strcmp(argv[1], "-bilinear")) {
+		g_bilinear = 1;
+		if (argc < 3) {
+			printf("Usage: kmsgrab [-v] [-bilinear] [-width N] [-height N] [--quality N] <output.png|output.jpg>\n");
 			goto out_return;
 		}
 		argv++;
@@ -360,9 +434,15 @@ int main(int argc, char **argv)
 			out_w = (uint32_t)strtoul(argv[2], NULL, 10);
 		} else if (!strcmp(argv[1], "-height")) {
 			out_h = (uint32_t)strtoul(argv[2], NULL, 10);
+		} else if (!strcmp(argv[1], "-quality") || !strcmp(argv[1], "--quality")) {
+			jpeg_quality = (int)strtoul(argv[2], NULL, 10);
+			if (jpeg_quality < 1)
+				jpeg_quality = 1;
+			if (jpeg_quality > 100)
+				jpeg_quality = 100;
 		} else {
 			printf("Unknown option: %s\n", argv[1]);
-			printf("Usage: kmsgrab [-v] [-width N] [-height N] <output.png|output.jpg>\n");
+			printf("Usage: kmsgrab [-v] [-bilinear] [-width N] [-height N] [--quality N] <output.png|output.jpg>\n");
 			goto out_return;
 		}
 		argv += 2;
@@ -370,7 +450,7 @@ int main(int argc, char **argv)
 	}
 
 	if (argc < 2) {
-		printf("Usage: kmsgrab [-v] [-width N] [-height N] <output.png|output.jpg>\n");
+		printf("Usage: kmsgrab [-v] [-bilinear] [-width N] [-height N] [--quality N] <output.png|output.jpg>\n");
 		goto out_return;
 	}
 
@@ -489,7 +569,7 @@ int main(int argc, char **argv)
 	}
 
 	if (strstr(argv[1], ".jpg") || strstr(argv[1], ".jpeg"))
-		err = save_jpg(fb, prime_fd, pitch, out_w, out_h, argv[1], 90);
+		err = save_jpg(fb, prime_fd, pitch, out_w, out_h, argv[1], jpeg_quality);
 	else
 		err = save_png(fb, prime_fd, pitch, out_w, out_h, argv[1]);
 	if (err < 0) {
