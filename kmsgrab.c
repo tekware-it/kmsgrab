@@ -33,6 +33,32 @@ static int g_verbose;
 		fprintf(stderr, __VA_ARGS__); \
 } while (0)
 
+static uint8_t *scale_rgb24(const uint8_t *src,
+			    uint32_t src_w, uint32_t src_h,
+			    uint32_t dst_w, uint32_t dst_h)
+{
+	uint8_t *dst;
+	uint32_t x, y;
+
+	dst = malloc((size_t)dst_w * dst_h * 3);
+	if (!dst)
+		return NULL;
+
+	for (y = 0; y < dst_h; y++) {
+		uint32_t sy = (uint64_t)y * src_h / dst_h;
+		for (x = 0; x < dst_w; x++) {
+			uint32_t sx = (uint64_t)x * src_w / dst_w;
+			const uint8_t *sp = src + (sy * src_w + sx) * 3;
+			uint8_t *dp = dst + (y * dst_w + x) * 3;
+			dp[0] = sp[0];
+			dp[1] = sp[1];
+			dp[2] = sp[2];
+		}
+	}
+
+	return dst;
+}
+
 static inline uint24_t rgb16_to_24(uint16_t px)
 {
 	uint24_t pixel;
@@ -73,13 +99,14 @@ static inline void convert_to_24(drmModeFB *fb, uint24_t *to, void *from)
 }
 
 static int save_png(drmModeFB *fb, int prime_fd, uint32_t pitch,
-		    const char *png_fn)
+		    uint32_t out_w, uint32_t out_h, const char *png_fn)
 {
 	png_bytep *row_pointers;
 	png_structp png;
 	png_infop info;
 	FILE *pngfile;
-	void *buffer, *picture, *linear;
+	void *buffer, *linear;
+	uint8_t *picture, *scaled = NULL, *pixels;
 	unsigned int i;
 	int ret;
 	size_t bytes_per_pixel = fb->bpp >> 3;
@@ -91,7 +118,7 @@ static int save_png(drmModeFB *fb, int prime_fd, uint32_t pitch,
 	DBG("[debug] save_png: prime_fd=%d pitch=%"PRIu32" png_fn=%s\n",
 		prime_fd, pitch, png_fn);
 
-	picture = malloc(fb->width * fb->height * 4);
+	picture = malloc((size_t)fb->width * fb->height * 4);
 	if (!picture)
 		return -ENOMEM;
 
@@ -135,7 +162,7 @@ static int save_png(drmModeFB *fb, int prime_fd, uint32_t pitch,
 	}
 
 	png_init_io(png, pngfile);
-	png_set_IHDR(png, info, fb->width, fb->height, 8,
+	png_set_IHDR(png, info, out_w, out_h, 8,
 				PNG_COLOR_TYPE_RGB,
 				PNG_INTERLACE_NONE,
 				PNG_COMPRESSION_TYPE_BASE,
@@ -148,20 +175,30 @@ static int save_png(drmModeFB *fb, int prime_fd, uint32_t pitch,
 		       (uint8_t *)buffer + i * pitch,
 		       fb->width * bytes_per_pixel);
 
-	convert_to_24(fb, picture, linear);
+	convert_to_24(fb, (uint24_t *)picture, linear);
+	if (out_w != fb->width || out_h != fb->height) {
+		scaled = scale_rgb24(picture, fb->width, fb->height, out_w, out_h);
+		if (!scaled) {
+			ret = -ENOMEM;
+			goto out_free_info;
+		}
+		pixels = scaled;
+	} else {
+		pixels = picture;
+	}
 
-	row_pointers = malloc(sizeof(*row_pointers) * fb->height);
+	row_pointers = malloc(sizeof(*row_pointers) * out_h);
 	if (!row_pointers) {
 		ret = -ENOMEM;
 		goto out_free_info;
 	}
 
 	// And save the final image
-	for (i = 0; i < fb->height; i++)
-		row_pointers[i] = picture + i * fb->width * 3;
+	for (i = 0; i < out_h; i++)
+		row_pointers[i] = pixels + i * out_w * 3;
 
 	DBG("[debug] save_png: writing PNG rows=%"PRIu32" row_bytes=%"PRIu32"\n",
-		fb->height, fb->width * 3);
+		out_h, out_w * 3);
 
 	png_write_image(png, row_pointers);
 	png_write_end(png, info);
@@ -169,6 +206,7 @@ static int save_png(drmModeFB *fb, int prime_fd, uint32_t pitch,
 	ret = 0;
 
 	free(row_pointers);
+	free(scaled);
 out_free_info:
 	png_destroy_write_struct(NULL, &info);
 out_free_png:
@@ -185,12 +223,14 @@ out_free_picture:
 }
 
 static int save_jpg(drmModeFB *fb, int prime_fd, uint32_t pitch,
+		    uint32_t out_w, uint32_t out_h,
 		    const char *jpg_fn, int quality)
 {
 	struct jpeg_compress_struct cinfo;
 	struct jpeg_error_mgr jerr;
 	FILE *jpgfile;
-	void *buffer, *picture, *linear;
+	void *buffer, *linear;
+	uint8_t *picture, *scaled = NULL, *pixels;
 	unsigned int i;
 	int ret;
 	size_t bytes_per_pixel = fb->bpp >> 3;
@@ -203,7 +243,7 @@ static int save_jpg(drmModeFB *fb, int prime_fd, uint32_t pitch,
 	DBG("[debug] save_jpg: prime_fd=%d pitch=%"PRIu32" jpg_fn=%s quality=%d\n",
 		prime_fd, pitch, jpg_fn, quality);
 
-	picture = malloc(fb->width * fb->height * 4);
+	picture = malloc((size_t)fb->width * fb->height * 4);
 	if (!picture)
 		return -ENOMEM;
 
@@ -238,14 +278,24 @@ static int save_jpg(drmModeFB *fb, int prime_fd, uint32_t pitch,
 		       (uint8_t *)buffer + i * pitch,
 		       fb->width * bytes_per_pixel);
 
-	convert_to_24(fb, picture, linear);
+	convert_to_24(fb, (uint24_t *)picture, linear);
+	if (out_w != fb->width || out_h != fb->height) {
+		scaled = scale_rgb24(picture, fb->width, fb->height, out_w, out_h);
+		if (!scaled) {
+			ret = -ENOMEM;
+			goto out_unmap_buffer;
+		}
+		pixels = scaled;
+	} else {
+		pixels = picture;
+	}
 
 	cinfo.err = jpeg_std_error(&jerr);
 	jpeg_create_compress(&cinfo);
 	jpeg_stdio_dest(&cinfo, jpgfile);
 
-	cinfo.image_width = fb->width;
-	cinfo.image_height = fb->height;
+	cinfo.image_width = out_w;
+	cinfo.image_height = out_h;
 	cinfo.input_components = 3;
 	cinfo.in_color_space = JCS_RGB;
 
@@ -254,8 +304,8 @@ static int save_jpg(drmModeFB *fb, int prime_fd, uint32_t pitch,
 	jpeg_start_compress(&cinfo, TRUE);
 
 	while (cinfo.next_scanline < cinfo.image_height) {
-		row_pointer[0] = (JSAMPROW)((uint8_t *)picture +
-				cinfo.next_scanline * fb->width * 3);
+		row_pointer[0] = (JSAMPROW)(pixels +
+				cinfo.next_scanline * out_w * 3);
 		jpeg_write_scanlines(&cinfo, row_pointer, 1);
 	}
 
@@ -265,6 +315,7 @@ static int save_jpg(drmModeFB *fb, int prime_fd, uint32_t pitch,
 	ret = 0;
 
 	fclose(jpgfile);
+	free(scaled);
 out_unmap_buffer:
 	munmap(buffer, mmap_size);
 out_free_linear:
@@ -285,22 +336,42 @@ int main(int argc, char **argv)
 	drmModeFB *fb;
 	drmModeFB2 *fb2;
 	uint32_t handle, pitch;
+	uint32_t out_w = 0, out_h = 0;
 	char buf[256];
 	uint64_t has_dumb;
 
 	if (argc < 2) {
-		printf("Usage: kmsgrab [-v] <output.png|output.jpg>\n");
+		printf("Usage: kmsgrab [-v] [-width N] [-height N] <output.png|output.jpg>\n");
 		goto out_return;
 	}
 
 	if (!strcmp(argv[1], "-v")) {
 		g_verbose = 1;
 		if (argc < 3) {
-			printf("Usage: kmsgrab [-v] <output.png|output.jpg>\n");
+			printf("Usage: kmsgrab [-v] [-width N] [-height N] <output.png|output.jpg>\n");
 			goto out_return;
 		}
 		argv++;
 		argc--;
+	}
+
+	while (argc >= 3 && argv[1][0] == '-') {
+		if (!strcmp(argv[1], "-width")) {
+			out_w = (uint32_t)strtoul(argv[2], NULL, 10);
+		} else if (!strcmp(argv[1], "-height")) {
+			out_h = (uint32_t)strtoul(argv[2], NULL, 10);
+		} else {
+			printf("Unknown option: %s\n", argv[1]);
+			printf("Usage: kmsgrab [-v] [-width N] [-height N] <output.png|output.jpg>\n");
+			goto out_return;
+		}
+		argv += 2;
+		argc -= 2;
+	}
+
+	if (argc < 2) {
+		printf("Usage: kmsgrab [-v] [-width N] [-height N] <output.png|output.jpg>\n");
+		goto out_return;
 	}
 
 	for (card = 0; ; card++) {
@@ -403,10 +474,24 @@ int main(int argc, char **argv)
 		goto out_free_fb;
 	}
 
+	if (!out_w && !out_h) {
+		out_w = fb->width;
+		out_h = fb->height;
+	} else if (!out_w) {
+		out_w = (uint32_t)((uint64_t)out_h * fb->width / fb->height);
+	} else if (!out_h) {
+		out_h = (uint32_t)((uint64_t)out_w * fb->height / fb->width);
+	}
+
+	if (out_w == 0 || out_h == 0) {
+		fprintf(stderr, "Invalid output size\n");
+		goto out_close_prime_fd;
+	}
+
 	if (strstr(argv[1], ".jpg") || strstr(argv[1], ".jpeg"))
-		err = save_jpg(fb, prime_fd, pitch, argv[1], 90);
+		err = save_jpg(fb, prime_fd, pitch, out_w, out_h, argv[1], 90);
 	else
-		err = save_png(fb, prime_fd, pitch, argv[1]);
+		err = save_png(fb, prime_fd, pitch, out_w, out_h, argv[1]);
 	if (err < 0) {
 		fprintf(stderr, "Failed to take screenshot: %s\n",
 			strerror(-err));
