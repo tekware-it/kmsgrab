@@ -3,6 +3,7 @@ project(kmsgrab LANGUAGES C VERSION 0.1)
 
 include(GNUInstallDirs)
 find_package(PNG REQUIRED)
+find_package(JPEG REQUIRED)
 find_package(PkgConfig REQUIRED)
 
 pkg_check_modules(DRM REQUIRED
@@ -14,6 +15,7 @@ add_executable(kmsgrab kmsgrab.c)
 
 target_link_libraries(kmsgrab PRIVATE
 	PNG::PNG
+	JPEG::JPEG
 	PkgConfig::DRM
 )
 

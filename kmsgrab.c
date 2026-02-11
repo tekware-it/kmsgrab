@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <png.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -19,6 +20,7 @@
 #include <unistd.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
+#include <jpeglib.h>
 
 typedef struct {
 	uint8_t r, g, b;
@@ -175,6 +177,96 @@ out_free_picture:
 	return ret;
 }
 
+static int save_jpg(drmModeFB *fb, int prime_fd, uint32_t pitch,
+		    const char *jpg_fn, int quality)
+{
+	struct jpeg_compress_struct cinfo;
+	struct jpeg_error_mgr jerr;
+	FILE *jpgfile;
+	void *buffer, *picture, *linear;
+	unsigned int i;
+	int ret;
+	size_t bytes_per_pixel = fb->bpp >> 3;
+	size_t linear_size = (size_t)fb->width * fb->height * bytes_per_pixel;
+	size_t mmap_size = (size_t)pitch * fb->height;
+	JSAMPROW row_pointer[1];
+
+	fprintf(stderr, "[debug] save_jpg: fb_id=%"PRIu32" width=%"PRIu32" height=%"PRIu32" bpp=%"PRIu32" depth=%"PRIu32" handle=%"PRIu32"\n",
+		fb->fb_id, fb->width, fb->height, fb->bpp, fb->depth, fb->handle);
+	fprintf(stderr, "[debug] save_jpg: prime_fd=%d pitch=%"PRIu32" jpg_fn=%s quality=%d\n",
+		prime_fd, pitch, jpg_fn, quality);
+
+	picture = malloc(fb->width * fb->height * 4);
+	if (!picture)
+		return -ENOMEM;
+
+	linear = malloc(linear_size);
+	if (!linear) {
+		ret = -ENOMEM;
+		goto out_free_picture;
+	}
+
+	buffer = mmap(NULL, mmap_size, PROT_READ, MAP_PRIVATE, prime_fd, 0);
+	if (buffer == MAP_FAILED) {
+		ret = -errno;
+		fprintf(stderr, "Unable to mmap prime buffer\n");
+		goto out_free_linear;
+	}
+
+	fprintf(stderr, "[debug] save_jpg: mmap length=%zu buffer=%p\n",
+		mmap_size, buffer);
+
+	/* Drop privileges, to write JPEG with user rights */
+	seteuid(getuid());
+
+	jpgfile = fopen(jpg_fn, "w+");
+	if (!jpgfile) {
+		ret = -errno;
+		goto out_unmap_buffer;
+	}
+
+	// Copy framebuffer using pitch to a linear buffer, then convert to rgb888.
+	for (i = 0; i < fb->height; i++)
+		memcpy((uint8_t *)linear + i * fb->width * bytes_per_pixel,
+		       (uint8_t *)buffer + i * pitch,
+		       fb->width * bytes_per_pixel);
+
+	convert_to_24(fb, picture, linear);
+
+	cinfo.err = jpeg_std_error(&jerr);
+	jpeg_create_compress(&cinfo);
+	jpeg_stdio_dest(&cinfo, jpgfile);
+
+	cinfo.image_width = fb->width;
+	cinfo.image_height = fb->height;
+	cinfo.input_components = 3;
+	cinfo.in_color_space = JCS_RGB;
+
+	jpeg_set_defaults(&cinfo);
+	jpeg_set_quality(&cinfo, quality, TRUE);
+	jpeg_start_compress(&cinfo, TRUE);
+
+	while (cinfo.next_scanline < cinfo.image_height) {
+		row_pointer[0] = (JSAMPROW)((uint8_t *)picture +
+				cinfo.next_scanline * fb->width * 3);
+		jpeg_write_scanlines(&cinfo, row_pointer, 1);
+	}
+
+	jpeg_finish_compress(&cinfo);
+	jpeg_destroy_compress(&cinfo);
+
+	ret = 0;
+
+	fclose(jpgfile);
+out_unmap_buffer:
+	munmap(buffer, mmap_size);
+out_free_linear:
+	free(linear);
+out_free_picture:
+	free(picture);
+	return ret;
+}
+
 int main(int argc, char **argv)
 {
 	int err, drm_fd, prime_fd, retval = EXIT_FAILURE;
@@ -190,7 +282,7 @@ int main(int argc, char **argv)
 	uint64_t has_dumb;
 
 	if (argc < 2) {
-		printf("Usage: kmsgrab <output.png>\n");
+		printf("Usage: kmsgrab <output.png|output.jpg>\n");
 		goto out_return;
 	}
 
@@ -294,7 +386,10 @@ int main(int argc, char **argv)
 		goto out_free_fb;
 	}
 
-	err = save_png(fb, prime_fd, pitch, argv[1]);
+	if (strstr(argv[1], ".jpg") || strstr(argv[1], ".jpeg"))
+		err = save_jpg(fb, prime_fd, pitch, argv[1], 90);
+	else
+		err = save_png(fb, prime_fd, pitch, argv[1]);
 	if (err < 0) {
 		fprintf(stderr, "Failed to take screenshot: %s\n",
 			strerror(-err));
