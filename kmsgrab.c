@@ -16,7 +16,10 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <ctype.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
@@ -388,71 +391,27 @@ out_free_picture:
 	return ret;
 }
 
-int main(int argc, char **argv)
+static void print_usage(const char *prog)
+{
+	printf("Usage: %s [-v] [-bilinear] [-daemon] [--socket PATH] [-width N] [-height N] [--quality N] <output.png|output.jpg>\n",
+	       prog);
+}
+
+static int grab_once(const char *output_fn, uint32_t req_w, uint32_t req_h,
+		     int jpeg_quality)
 {
 	int err, drm_fd, prime_fd, retval = EXIT_FAILURE;
 	unsigned int i, card;
-	uint32_t fb_id, crtc_id;
+	uint32_t fb_id = 0, crtc_id = 0;
 	uint32_t plane_id = 0;
 	drmModePlaneRes *plane_res;
 	drmModePlane *plane;
 	drmModeFB *fb;
 	drmModeFB2 *fb2;
 	uint32_t handle, pitch;
-	uint32_t out_w = 0, out_h = 0;
-	int jpeg_quality = 90;
+	uint32_t out_w = req_w, out_h = req_h;
 	char buf[256];
 	uint64_t has_dumb;
-
-	if (argc < 2) {
-		printf("Usage: kmsgrab [-v] [-bilinear] [-width N] [-height N] [--quality N] <output.png|output.jpg>\n");
-		goto out_return;
-	}
-
-	if (!strcmp(argv[1], "-v")) {
-		g_verbose = 1;
-		if (argc < 3) {
-			printf("Usage: kmsgrab [-v] [-bilinear] [-width N] [-height N] [--quality N] <output.png|output.jpg>\n");
-			goto out_return;
-		}
-		argv++;
-		argc--;
-	}
-
-	if (!strcmp(argv[1], "-bilinear")) {
-		g_bilinear = 1;
-		if (argc < 3) {
-			printf("Usage: kmsgrab [-v] [-bilinear] [-width N] [-height N] [--quality N] <output.png|output.jpg>\n");
-			goto out_return;
-		}
-		argv++;
-		argc--;
-	}
-
-	while (argc >= 3 && argv[1][0] == '-') {
-		if (!strcmp(argv[1], "-width")) {
-			out_w = (uint32_t)strtoul(argv[2], NULL, 10);
-		} else if (!strcmp(argv[1], "-height")) {
-			out_h = (uint32_t)strtoul(argv[2], NULL, 10);
-		} else if (!strcmp(argv[1], "-quality") || !strcmp(argv[1], "--quality")) {
-			jpeg_quality = (int)strtoul(argv[2], NULL, 10);
-			if (jpeg_quality < 1)
-				jpeg_quality = 1;
-			if (jpeg_quality > 100)
-				jpeg_quality = 100;
-		} else {
-			printf("Unknown option: %s\n", argv[1]);
-			printf("Usage: kmsgrab [-v] [-bilinear] [-width N] [-height N] [--quality N] <output.png|output.jpg>\n");
-			goto out_return;
-		}
-		argv += 2;
-		argc -= 2;
-	}
-
-	if (argc < 2) {
-		printf("Usage: kmsgrab [-v] [-bilinear] [-width N] [-height N] [--quality N] <output.png|output.jpg>\n");
-		goto out_return;
-	}
 
 	for (card = 0; ; card++) {
 		snprintf(buf, sizeof(buf), "/dev/dri/card%u", card);
@@ -568,10 +527,10 @@ int main(int argc, char **argv)
 		goto out_close_prime_fd;
 	}
 
-	if (strstr(argv[1], ".jpg") || strstr(argv[1], ".jpeg"))
-		err = save_jpg(fb, prime_fd, pitch, out_w, out_h, argv[1], jpeg_quality);
+	if (strstr(output_fn, ".jpg") || strstr(output_fn, ".jpeg"))
+		err = save_jpg(fb, prime_fd, pitch, out_w, out_h, output_fn, jpeg_quality);
 	else
-		err = save_png(fb, prime_fd, pitch, out_w, out_h, argv[1]);
+		err = save_png(fb, prime_fd, pitch, out_w, out_h, output_fn);
 	if (err < 0) {
 		fprintf(stderr, "Failed to take screenshot: %s\n",
 			strerror(-err));
@@ -590,4 +549,161 @@ out_close_fd:
 	close(drm_fd);
 out_return:
 	return retval;
+}
+
+static int run_daemon(const char *socket_path, const char *output_fn,
+		      uint32_t req_w, uint32_t req_h, int jpeg_quality)
+{
+	int srv_fd, cli_fd, ret = EXIT_FAILURE;
+	struct sockaddr_un addr;
+
+	srv_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (srv_fd < 0) {
+		fprintf(stderr, "Unable to create IPC socket: %s\n", strerror(errno));
+		return EXIT_FAILURE;
+	}
+
+	memset(&addr, 0, sizeof(addr));
+	addr.sun_family = AF_UNIX;
+	if (strlen(socket_path) >= sizeof(addr.sun_path)) {
+		fprintf(stderr, "Socket path too long: %s\n", socket_path);
+		goto out_close_srv;
+	}
+	strcpy(addr.sun_path, socket_path);
+
+	unlink(socket_path);
+	if (bind(srv_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		fprintf(stderr, "Unable to bind IPC socket %s: %s\n",
+			socket_path, strerror(errno));
+		goto out_close_srv;
+	}
+
+	if (listen(srv_fd, 4) < 0) {
+		fprintf(stderr, "Unable to listen on IPC socket %s: %s\n",
+			socket_path, strerror(errno));
+		goto out_unlink_socket;
+	}
+
+	DBG("[debug] daemon listening on %s\n", socket_path);
+
+	for (;;) {
+		char buf[128];
+		ssize_t len;
+		char *cmd;
+
+		cli_fd = accept(srv_fd, NULL, NULL);
+		if (cli_fd < 0) {
+			if (errno == EINTR)
+				continue;
+			fprintf(stderr, "IPC accept failed: %s\n", strerror(errno));
+			break;
+		}
+
+		len = read(cli_fd, buf, sizeof(buf) - 1);
+		if (len <= 0) {
+			close(cli_fd);
+			continue;
+		}
+		buf[len] = '\0';
+
+		cmd = buf;
+		while (*cmd && isspace((unsigned char)*cmd))
+			cmd++;
+		for (len = strlen(cmd); len > 0; len--) {
+			if (!isspace((unsigned char)cmd[len - 1]))
+				break;
+			cmd[len - 1] = '\0';
+		}
+
+		if (!strcmp(cmd, "GRAB")) {
+			if (grab_once(output_fn, req_w, req_h, jpeg_quality) == EXIT_SUCCESS)
+				write(cli_fd, "OK\n", 3);
+			else
+				write(cli_fd, "ERR grab failed\n", 16);
+		} else {
+			write(cli_fd, "ERR unsupported command\n", 24);
+		}
+
+		close(cli_fd);
+	}
+
+out_unlink_socket:
+	unlink(socket_path);
+out_close_srv:
+	close(srv_fd);
+	return ret;
+}
+
+int main(int argc, char **argv)
+{
+	uint32_t out_w = 0, out_h = 0;
+	int jpeg_quality = 90;
+	int daemon_mode = 0;
+	const char *socket_path = "/tmp/kmsgrab.sock";
+	const char *output_fn = NULL;
+	int i;
+
+	if (argc < 2) {
+		print_usage(argv[0]);
+		return EXIT_FAILURE;
+	}
+
+	for (i = 1; i < argc; i++) {
+		if (!strcmp(argv[i], "-v")) {
+			g_verbose = 1;
+		} else if (!strcmp(argv[i], "-bilinear")) {
+			g_bilinear = 1;
+		} else if (!strcmp(argv[i], "-daemon") || !strcmp(argv[i], "--daemon")) {
+			daemon_mode = 1;
+		} else if (!strcmp(argv[i], "-width")) {
+			if (++i >= argc) {
+				print_usage(argv[0]);
+				return EXIT_FAILURE;
+			}
+			out_w = (uint32_t)strtoul(argv[i], NULL, 10);
+		} else if (!strcmp(argv[i], "-height")) {
+			if (++i >= argc) {
+				print_usage(argv[0]);
+				return EXIT_FAILURE;
+			}
+			out_h = (uint32_t)strtoul(argv[i], NULL, 10);
+		} else if (!strcmp(argv[i], "-quality") || !strcmp(argv[i], "--quality")) {
+			if (++i >= argc) {
+				print_usage(argv[0]);
+				return EXIT_FAILURE;
+			}
+			jpeg_quality = (int)strtoul(argv[i], NULL, 10);
+			if (jpeg_quality < 1)
+				jpeg_quality = 1;
+			if (jpeg_quality > 100)
+				jpeg_quality = 100;
+		} else if (!strcmp(argv[i], "--socket")) {
+			if (++i >= argc) {
+				print_usage(argv[0]);
+				return EXIT_FAILURE;
+			}
+			socket_path = argv[i];
+		} else if (argv[i][0] == '-') {
+			fprintf(stderr, "Unknown option: %s\n", argv[i]);
+			print_usage(argv[0]);
+			return EXIT_FAILURE;
+		} else {
+			if (output_fn) {
+				fprintf(stderr, "Unexpected extra positional argument: %s\n", argv[i]);
+				print_usage(argv[0]);
+				return EXIT_FAILURE;
+			}
+			output_fn = argv[i];
+		}
+	}
+
+	if (!output_fn) {
+		print_usage(argv[0]);
+		return EXIT_FAILURE;
+	}
+
+	if (daemon_mode)
+		return run_daemon(socket_path, output_fn, out_w, out_h, jpeg_quality);
+
+	return grab_once(output_fn, out_w, out_h, jpeg_quality);
 }
